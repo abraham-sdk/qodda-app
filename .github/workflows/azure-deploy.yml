@@ -1,0 +1,228 @@
+name: Build and Deploy to Azure
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AZURE_CONTAINER_REGISTRY: qodda
+  CONTAINER_NAME: qodda-app
+  RESOURCE_GROUP: qodda-rg
+  CLUSTER_NAME: qodda-aks
+  NODE_VERSION: '18'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run linter
+      run: npm run lint
+    
+    - name: Run type checking
+      run: npm run type-check
+    
+    - name: Run unit tests
+      run: npm run test
+      env:
+        NODE_ENV: test
+    
+    - name: Run integration tests
+      run: npm run test:integration
+      env:
+        NODE_ENV: test
+    
+    - name: Build application
+      run: npm run build
+      env:
+        NODE_ENV: production
+    
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-files
+        path: |
+          .next/
+          public/
+        retention-days: 1
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run security audit
+      run: npm audit --audit-level high
+    
+    - name: Run Snyk security scan
+      uses: snyk/actions/node@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high
+
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, security-scan]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Azure Container Registry Login
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io
+        username: ${{ secrets.AZURE_ACR_USERNAME }}
+        password: ${{ secrets.AZURE_ACR_PASSWORD }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.CONTAINER_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: build-and-push-image
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Deploy to Azure Container Instances (Staging)
+      uses: azure/aci-deploy@v1
+      with:
+        resource-group: ${{ env.RESOURCE_GROUP }}
+        dns-name-label: qodda-staging-${{ github.run_number }}
+        image: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.CONTAINER_NAME }}:develop-${{ github.sha }}
+        registry-login-server: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io
+        registry-username: ${{ secrets.AZURE_ACR_USERNAME }}
+        registry-password: ${{ secrets.AZURE_ACR_PASSWORD }}
+        name: qodda-staging
+        location: 'East US'
+        cpu: 1
+        memory: 2
+        ports: 3000
+        environment-variables: |
+          NODE_ENV=staging
+          NEXT_PUBLIC_APP_ENV=staging
+        secure-environment-variables: |
+          AZURE_CUSTOM_VISION_ENDPOINT=${{ secrets.AZURE_CUSTOM_VISION_ENDPOINT_STAGING }}
+          AZURE_CUSTOM_VISION_PREDICTION_KEY=${{ secrets.AZURE_CUSTOM_VISION_PREDICTION_KEY_STAGING }}
+          AZURE_STORAGE_ACCOUNT_NAME=${{ secrets.AZURE_STORAGE_ACCOUNT_NAME_STAGING }}
+          AZURE_STORAGE_ACCOUNT_KEY=${{ secrets.AZURE_STORAGE_ACCOUNT_KEY_STAGING }}
+          AZURE_COSMOS_ENDPOINT=${{ secrets.AZURE_COSMOS_ENDPOINT_STAGING }}
+          AZURE_COSMOS_KEY=${{ secrets.AZURE_COSMOS_KEY_STAGING }}
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: build-and-push-image
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Deploy Infrastructure
+      run: |
+        az deployment group create \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --template-file ./infrastructure/main.bicep \
+          --parameters @./infrastructure/parameters.prod.json \
+          --parameters containerImage="${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.CONTAINER_NAME }}:main-${{ github.sha }}"
+    
+    - name: Deploy to Azure Container Instances (Production)
+      uses: azure/aci-deploy@v1
+      with:
+        resource-group: ${{ env.RESOURCE_GROUP }}
+        dns-name-label: qodda-prod
+        image: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io/${{ env.CONTAINER_NAME }}:main-${{ github.sha }}
+        registry-login-server: ${{ env.AZURE_CONTAINER_REGISTRY }}.azurecr.io
+        registry-username: ${{ secrets.AZURE_ACR_USERNAME }}
+        registry-password: ${{ secrets.AZURE_ACR_PASSWORD }}
+        name: qodda-production
+        location: 'East US'
+        cpu: 2
+        memory: 4
+        ports: 3000
+        environment-variables: |
+          NODE_ENV=production
+          NEXT_PUBLIC_APP_ENV=production
+        secure-environment-variables: |
+          AZURE_CUSTOM_VISION_ENDPOINT=${{ secrets.AZURE_CUSTOM_VISION_ENDPOINT }}
+          AZURE_CUSTOM_VISION_PREDICTION_KEY=${{ secrets.AZURE_CUSTOM_VISION_PREDICTION_KEY }}
+          AZURE_STORAGE_ACCOUNT_NAME=${{ secrets.AZURE_STORAGE_ACCOUNT_NAME }}
+          AZURE_STORAGE_ACCOUNT_KEY=${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+          AZURE_COSMOS_ENDPOINT=${{ secrets.AZURE_COSMOS_ENDPOINT }}
+          AZURE_COSMOS_KEY=${{ secrets.AZURE_COSMOS_KEY }}
+          AZURE_APPLICATION_INSIGHTS_CONNECTION_STRING=${{ secrets.AZURE_APPLICATION_INSIGHTS_CONNECTION_STRING }}
+    
+    - name: Run smoke tests
+      run: |
+        sleep 30
+        curl -f https://qodda-prod.eastus.azurecontainer.io/api/health || exit 1
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Notify deployment status
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        # webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
